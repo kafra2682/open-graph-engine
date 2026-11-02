@@ -1,89 +1,152 @@
-from fastapi import FastAPI, HTTPException, Query
+import os
+import re
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Query, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 import httpx
-import random
+from bs4 import BeautifulSoup
+import trafilatura
 
 app = FastAPI(
-    title="Multi-Agent Data Ingestion API - Anti-Detection",
-    version="1.1.0",
-    description="Endpoint di ingestione con bypass 403 tramite fingerprinting HTTP/Headers avanzati."
+    title="Article & Web Content Extractor API",
+    description="API ad alte prestazioni per l'estrazione pulita di testo e metadati da qualsiasi URL.",
+    version="1.1.0"
 )
 
-# Pool di User-Agent realistici ed aggiornati
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-]
+# Configurazione CORS per consentire chiamate da RapidAPI e frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def build_stealth_headers() -> dict:
-    """Genera header HTTP completi per simulare un browser reale e prevenire l'errore 403."""
-    ua = random.choice(USER_AGENTS)
-    is_firefox = "Firefox" in ua
+# Headers realistici per aggirare protezioni anti-scraping (Cloudflare, Akamai, 403 Forbidden)
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.google.com/",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-User": "?1",
+}
 
-    headers = {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,it-IT;q=0.8,it;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0"
-    }
+class ExtractRequest(BaseModel):
+    url: HttpUrl
 
-    if not is_firefox:
-        headers["sec-ch-ua"] = '"Chromium";v="123", "Not:A-Brand";v="8"'
-        headers["sec-ch-ua-mobile"] = "?0"
-        headers["sec-ch-ua-platform"] = '"Windows"' if "Windows" in ua else '"macOS"'
-
-    return headers
-
-class ScrapeResponse(BaseModel):
-    status_code: int
+class ExtractResponse(BaseModel):
+    status: str
     url: str
-    content_length: int
-    content_preview: str
+    title: Optional[str] = None
+    author: Optional[str] = None
+    date: Optional[str] = None
+    content: str
+    word_count: int
 
-@app.get("/fetch", response_model=ScrapeResponse)
-async def fetch_target(url: HttpUrl = Query(..., description="URL target da analizzare")):
-    """Esegue una richiesta HTTP GET avanzata bypassando filtri anti-bot elementari e WAF base."""
-    target_url = str(url)
-    headers = build_stealth_headers()
-    
-    timeout_config = httpx.Timeout(15.0, connect=10.0)
-    
+async def fetch_and_extract(target_url: str) -> ExtractResponse:
+    target_url_str = str(target_url)
     try:
-        async with httpx.AsyncClient(headers=headers, timeout=timeout_config, follow_redirects=True) as client:
-            response = await client.get(target_url)
+        async with httpx.AsyncClient(
+            headers=BROWSER_HEADERS,
+            follow_redirects=True,
+            timeout=15.0,
+            verify=False
+        ) as client:
+            response = await client.get(target_url_str)
             
             if response.status_code == 403:
                 raise HTTPException(
-                    status_code=403, 
-                    detail="Errore 403: Blocco WAF/Cloudflare persistente. Necessario modulo Headless o Proxy residenziali."
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Accesso negato dal server di destinazione (403 Forbidden). Protezione anti-bot attiva."
                 )
-            
+            if response.status_code == 404:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="La pagina di destinazione non esiste (404 Not Found)."
+                )
             response.raise_for_status()
+            html_content = response.text
+
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Impossibile connettersi all'URL specificato: {str(exc)}"
+        )
+
+    # Estrazione primaria con Trafilatura
+    extracted_text = trafilatura.extract(
+        html_content,
+        include_comments=False,
+        include_tables=True,
+        no_fallback=False
+    )
+    metadata = trafilatura.extract_metadata(html_content)
+
+    title = metadata.title if metadata and metadata.title else None
+    author = metadata.author if metadata and metadata.author else None
+    date = metadata.date if metadata and metadata.date else None
+
+    # Fallback su BeautifulSoup se Trafilatura non ottiene risultati sufficienti
+    if not extracted_text or len(extracted_text.strip()) < 50:
+        soup = BeautifulSoup(html_content, "html.parser")
+        
+        for element in soup(["script", "style", "nav", "footer", "header", "noscript", "aside", "svg"]):
+            element.decompose()
             
-            text_content = response.text
-            return ScrapeResponse(
-                status_code=response.status_code,
-                url=target_url,
-                content_length=len(text_content),
-                content_preview=text_content[:500]
-            )
+        if not title and soup.title:
+            title = soup.title.string.strip() if soup.title.string else None
 
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=f"Errore HTTP target: {str(e)}")
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Errore di rete/connessione target: {str(e)}")
+        body = soup.find("body")
+        if body:
+            extracted_text = " ".join(body.stripped_strings)
+        else:
+            extracted_text = ""
 
-@app.get("/health")
-def health_check():
-    return {"status": "active", "phase": "1 - Anti-403 Hotfix Applied"}
+    clean_text = re.sub(r"\s+", " ", extracted_text or "").strip()
+    words = len(clean_text.split()) if clean_text else 0
+
+    return ExtractResponse(
+        status="success",
+        url=target_url_str,
+        title=title,
+        author=author,
+        date=date,
+        content=clean_text,
+        word_count=words
+    )
+
+# Endpoint configurato specificamente per RapidAPI (/extract sia POST che GET)
+@app.post("/extract", response_model=ExtractResponse, tags=["Extraction"])
+async def extract_article_post(payload: ExtractRequest):
+    """Estrae il contenuto inviando un payload JSON: {'url': 'https://...' }"""
+    return await fetch_and_extract(payload.url)
+
+@app.get("/extract", response_model=ExtractResponse, tags=["Extraction"])
+async def extract_article_get(url: HttpUrl = Query(..., description="URL della pagina da analizzare")):
+    """Estrae il contenuto passando il parametro query: /extract?url=https://..."""
+    return await fetch_and_extract(url)
+
+# Aliases sulla Root (/) per evitare 404 in caso di configurazione base su RapidAPI
+@app.post("/", response_model=ExtractResponse, include_in_schema=False)
+async def extract_root_post(payload: ExtractRequest):
+    return await fetch_and_extract(payload.url)
+
+@app.get("/", tags=["Health Check"])
+async def health_check():
+    return {
+        "status": "online",
+        "service": "Article Extractor API",
+        "active_endpoints": ["/extract", "/docs"]
+    }
