@@ -1,20 +1,18 @@
-import os
-import re
+import urllib.parse
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, Query, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
-import httpx
-from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field
 import trafilatura
+from trafilatura.settings import use_config
 
 app = FastAPI(
-    title="Article & Web Content Extractor API",
-    description="API ad alte prestazioni per l'estrazione pulita di testo e metadati da qualsiasi URL.",
-    version="1.1.0"
+    title="Article Extraction API",
+    description="High-performance extraction API compatible with RapidAPI GET/POST specifications",
+    version="1.0.0"
 )
 
-# Configurazione CORS per consentire chiamate da RapidAPI e frontend
+# Configurazione CORS per accettare chiamate da RapidAPI console e frontend esterni
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,28 +21,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Headers realistici per aggirare protezioni anti-scraping (Cloudflare, Akamai, 403 Forbidden)
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.google.com/",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "cross-site",
-    "Sec-Fetch-User": "?1",
-}
+# Configurazione Trafilatura con User-Agent realistico per evitare blocchi 403
+trafilatura_config = use_config()
+trafilatura_config.set("DEFAULT", "USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+trafilatura_config.set("DEFAULT", "DOWNLOAD_TIMEOUT", "15")
 
 class ExtractRequest(BaseModel):
-    url: HttpUrl
+    url: str = Field(..., description="Target webpage URL to extract")
 
 class ExtractResponse(BaseModel):
     status: str
@@ -52,101 +35,62 @@ class ExtractResponse(BaseModel):
     title: Optional[str] = None
     author: Optional[str] = None
     date: Optional[str] = None
-    content: str
-    word_count: int
+    text: Optional[str] = None
+    length: int
 
-async def fetch_and_extract(target_url: str) -> ExtractResponse:
-    target_url_str = str(target_url)
-    try:
-        async with httpx.AsyncClient(
-            headers=BROWSER_HEADERS,
-            follow_redirects=True,
-            timeout=15.0,
-            verify=False
-        ) as client:
-            response = await client.get(target_url_str)
-            
-            if response.status_code == 403:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Accesso negato dal server di destinazione (403 Forbidden). Protezione anti-bot attiva."
-                )
-            if response.status_code == 404:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="La pagina di destinazione non esiste (404 Not Found)."
-                )
-            response.raise_for_status()
-            html_content = response.text
+def sanitize_and_extract(raw_url: str) -> dict:
+    decoded_url = urllib.parse.unquote(raw_url.strip())
+    
+    if not decoded_url.startswith(("http://", "https://")):
+        decoded_url = "https://" + decoded_url
 
-    except httpx.RequestError as exc:
+    downloaded = trafilatura.fetch_url(decoded_url, config=trafilatura_config)
+    
+    if not downloaded:
         raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Impossibile connettersi all'URL specificato: {str(exc)}"
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Impossibile scaricare la pagina all'URL specificato: {decoded_url}"
         )
 
-    # Estrazione primaria con Trafilatura
-    extracted_text = trafilatura.extract(
-        html_content,
+    result = trafilatura.extract(
+        downloaded,
         include_comments=False,
         include_tables=True,
-        no_fallback=False
-    )
-    metadata = trafilatura.extract_metadata(html_content)
-
-    title = metadata.title if metadata and metadata.title else None
-    author = metadata.author if metadata and metadata.author else None
-    date = metadata.date if metadata and metadata.date else None
-
-    # Fallback su BeautifulSoup se Trafilatura non ottiene risultati sufficienti
-    if not extracted_text or len(extracted_text.strip()) < 50:
-        soup = BeautifulSoup(html_content, "html.parser")
-        
-        for element in soup(["script", "style", "nav", "footer", "header", "noscript", "aside", "svg"]):
-            element.decompose()
-            
-        if not title and soup.title:
-            title = soup.title.string.strip() if soup.title.string else None
-
-        body = soup.find("body")
-        if body:
-            extracted_text = " ".join(body.stripped_strings)
-        else:
-            extracted_text = ""
-
-    clean_text = re.sub(r"\s+", " ", extracted_text or "").strip()
-    words = len(clean_text.split()) if clean_text else 0
-
-    return ExtractResponse(
-        status="success",
-        url=target_url_str,
-        title=title,
-        author=author,
-        date=date,
-        content=clean_text,
-        word_count=words
+        output_format="python"
     )
 
-# Endpoint configurato specificamente per RapidAPI (/extract sia POST che GET)
-@app.post("/extract", response_model=ExtractResponse, tags=["Extraction"])
-async def extract_article_post(payload: ExtractRequest):
-    """Estrae il contenuto inviando un payload JSON: {'url': 'https://...' }"""
-    return await fetch_and_extract(payload.url)
+    if not result or not result.get("text"):
+        raise HTTPException(
+            status_code=status.HTTP_204_NO_CONTENT,
+            detail="Nessun contenuto leggibile estratto dalla pagina richiesta."
+        )
 
-@app.get("/extract", response_model=ExtractResponse, tags=["Extraction"])
-async def extract_article_get(url: HttpUrl = Query(..., description="URL della pagina da analizzare")):
-    """Estrae il contenuto passando il parametro query: /extract?url=https://..."""
-    return await fetch_and_extract(url)
+    text_content = result.get("text", "")
 
-# Aliases sulla Root (/) per evitare 404 in caso di configurazione base su RapidAPI
-@app.post("/", response_model=ExtractResponse, include_in_schema=False)
-async def extract_root_post(payload: ExtractRequest):
-    return await fetch_and_extract(payload.url)
-
-@app.get("/", tags=["Health Check"])
-async def health_check():
     return {
-        "status": "online",
-        "service": "Article Extractor API",
-        "active_endpoints": ["/extract", "/docs"]
+        "status": "success",
+        "url": decoded_url,
+        "title": result.get("title"),
+        "author": result.get("author"),
+        "date": result.get("date"),
+        "text": text_content,
+        "length": len(text_content)
     }
+
+@app.get("/")
+def health_check():
+    return {"status": "online", "service": "Article Extraction API"}
+
+# Supporto nativo GET: accetta parametro URL come stringa grezza per evitare il parsing rigido di HttpUrl
+@app.get("/extract", response_model=ExtractResponse)
+@app.get("/extract/", response_model=ExtractResponse, include_in_schema=False)
+def extract_get(
+    url: str = Query(..., description="The full URL to extract (escaped or unescaped)")
+):
+    return sanitize_and_extract(url)
+
+# Supporto nativo POST: garantisce compatibilità sia per payload JSON che form standard
+@app.post("/extract", response_model=ExtractResponse)
+@app.post("/extract/", response_model=ExtractResponse, include_in_schema=False)
+def extract_post(payload: ExtractRequest):
+    return sanitize_and_extract(payload.url)
